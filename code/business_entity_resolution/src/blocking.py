@@ -1,15 +1,16 @@
 import gc
 import os
 import sys
+import time
 import numpy as np
 import pandas as pd
-from scipy.sparse import csr_matrix, vstack, hstack
+import scipy.sparse as sp
+from sparse_dot_topn import sp_matmul_topn
 from sklearn.feature_extraction.text import TfidfVectorizer
+from joblib import Parallel, delayed
 
 sys.path.insert(0, os.path.dirname(__file__))
 from data_loader import load_source_file, load_ground_truth
-
-DENSE_MODEL_NAME = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 
 
 def verify_country_integrity(df_s1: pd.DataFrame, df_s2: pd.DataFrame, df_s3: pd.DataFrame, df_gt: pd.DataFrame) -> bool:
@@ -42,113 +43,171 @@ def verify_country_integrity(df_s1: pd.DataFrame, df_s2: pd.DataFrame, df_s3: pd
     return True
 
 
+def parallel_tfidf_transform(vec, texts, chunk_size=150000, n_jobs=-1):
+    """
+    Parallel TF-IDF vectorization across CPU cores.
+    """
+    chunks = [texts[i : i + chunk_size] for i in range(0, len(texts), chunk_size)]
+    blocks = Parallel(n_jobs=n_jobs, prefer="threads")(
+        delayed(vec.transform)(chunk) for chunk in chunks
+    )
+    return sp.vstack(blocks, format="csr")
+
+
+def fast_chunked_sparse_topk(X_s1, X_target, target_ids, top_k=10, chunk_size=500000, n_threads=4):
+    """
+    Computes top-K candidates across target sparse matrix in target chunks using C++ sparse_dot_topn.
+    Returns: list of candidate ID lists per query row index.
+    """
+    n_queries = X_s1.shape[0]
+    n_targets = X_target.shape[0]
+
+    cand_indices = [[] for _ in range(n_queries)]
+    cand_sims = [[] for _ in range(n_queries)]
+
+    for c_start in range(0, n_targets, chunk_size):
+        c_end = min(c_start + chunk_size, n_targets)
+        X_target_chunk = X_target[c_start:c_end]
+
+        # C++ parallel sparse matrix multiplication
+        sim_mat = sp_matmul_topn(
+            A=X_s1,
+            B=X_target_chunk.T,
+            top_n=top_k,
+            threshold=0.01,
+            sort=True,
+            n_threads=n_threads
+        )
+
+        indptr = sim_mat.indptr
+        indices = sim_mat.indices
+        data = sim_mat.data
+
+        for q_idx in range(n_queries):
+            r_start, r_end = indptr[q_idx], indptr[q_idx + 1]
+            if r_start < r_end:
+                t_idx_local = indices[r_start:r_end]
+                sim_values = data[r_start:r_end]
+
+                t_idx_global = t_idx_local + c_start
+                cand_indices[q_idx].extend(t_idx_global)
+                cand_sims[q_idx].extend(sim_values)
+
+    results = []
+    for q_idx in range(n_queries):
+        if not cand_sims[q_idx]:
+            results.append([])
+        else:
+            sims = np.array(cand_sims[q_idx])
+            idxs = np.array(cand_indices[q_idx])
+
+            top_k_idx = np.argsort(sims)[::-1][:top_k]
+            top_target_ids = [target_ids[idxs[k]] for k in top_k_idx]
+            results.append(top_target_ids)
+
+    return results
+
+
 def get_multi_stage_candidates_for_partition(
     df_s1: pd.DataFrame,
     df_targets: pd.DataFrame,
     max_candidates_per_s1: int = 20
 ) -> dict:
     """
-    Generates high-recall candidate pairs per country partition using multi-stage blocking:
-    - Stage 1: Word-level TF-IDF (1,2) with max_df=0.02, min_df=2 (Full Name + Address)
-    - Stage 2: Char-level TF-IDF (3,4) with max_df=0.02, min_df=3 (Handles typos, spellings & acronyms)
-    - Union of retrieved candidates per entity.
+    Generates high-recall candidate pairs per country partition using ultra-fast multi-channel blocking:
+    - Channel 1: Word-level TF-IDF (1,2) on Full Name + Address (Top 10)
+    - Channel 2: Word-level TF-IDF (1,2) on Business Name only (Top 8)
+    - Channel 3: Char_wb TF-IDF (3,4) on Business Name only (Top 6, handles typos & spellings)
+    - Multi-threaded C++ sp_matmul_topn execution.
     """
     if len(df_s1) == 0 or len(df_targets) == 0:
         return {s1_id: [] for s1_id in df_s1["entity_id"]}
 
-    s1_texts = (df_s1["business_name"].fillna('') + " " + df_s1["business_address"].fillna('')).values
-    target_texts = (df_targets["business_name"].fillna('') + " " + df_targets["business_address"].fillna('')).values
-
     s1_ids = df_s1["entity_id"].values
     target_ids = df_targets["entity_id"].values
 
-    sample_size = min(200000, len(target_texts))
-    sample_texts = target_texts[:sample_size]
+    s1_name_addr = (df_s1["business_name"].fillna('') + " " + df_s1["business_address"].fillna('')).values
+    target_name_addr = (df_targets["business_name"].fillna('') + " " + df_targets["business_address"].fillna('')).values
 
-    chunk_size = 500000
-    batch_size = 2000
-    candidates_map = {s1_id: [] for s1_id in s1_ids}
+    s1_name = df_s1["business_name"].fillna('').values
+    target_name = df_targets["business_name"].fillna('').values
 
-    # --- STAGE 1: Word-level TF-IDF (1,2) ---
-    print(f"    [Stage 1] Fitting Word TF-IDF (max_df=0.02) on sample of {sample_size:,} records...", flush=True)
-    vec_word = TfidfVectorizer(
+    sample_size = min(200000, len(target_name_addr))
+    sample_indices = np.random.choice(len(target_name_addr), size=sample_size, replace=False) if len(target_name_addr) > sample_size else np.arange(len(target_name_addr))
+    
+    n_threads = max(1, (os.cpu_count() or 4) - 1)
+
+    # --- CHANNEL 1: Word-level TF-IDF (Full Name + Address) ---
+    print(f"    [Channel 1] Fitting Word TF-IDF (Name+Addr) on sample of {sample_size:,} records...", flush=True)
+    vec1 = TfidfVectorizer(
         ngram_range=(1, 2),
-        max_df=0.02,
+        max_df=0.005,
         min_df=2,
-        max_features=120000,
+        max_features=80000,
         sublinear_tf=True
     )
-    vec_word.fit(sample_texts)
+    vec1.fit(target_name_addr[sample_indices])
 
-    print("    [Stage 1] Transforming Target records in chunks...", flush=True)
-    target_word_blocks = [vec_word.transform(target_texts[c:c+chunk_size]) for c in range(0, len(target_texts), chunk_size)]
-    X_target_word = vstack(target_word_blocks, format="csr")
-    del target_word_blocks
+    print("    [Channel 1] Transforming Target and S1 Query matrices...", flush=True)
+    X_target_1 = parallel_tfidf_transform(vec1, target_name_addr, n_jobs=n_threads)
+    X_s1_1 = parallel_tfidf_transform(vec1, s1_name_addr, n_jobs=n_threads)
 
-    print("    [Stage 1] Transforming S1 Query records...", flush=True)
-    X_s1_word = vec_word.transform(s1_texts)
+    print("    [Channel 1] Retrieving Top-K Candidates with sparse_dot_topn C++...", flush=True)
+    ch1_cands = fast_chunked_sparse_topk(X_s1_1, X_target_1, target_ids, top_k=10, n_threads=n_threads)
 
-    print("    [Stage 1] Retrieving Word Top-K Candidates...", flush=True)
-    for start_idx in range(0, X_s1_word.shape[0], batch_size):
-        end_idx = min(start_idx + batch_size, X_s1_word.shape[0])
-        sim_matrix = X_s1_word[start_idx:end_idx].dot(X_target_word.T).tocsr()
-
-        indptr, indices, data = sim_matrix.indptr, sim_matrix.indices, sim_matrix.data
-        for i in range(sim_matrix.shape[0]):
-            s1_id = s1_ids[start_idx + i]
-            r_start, r_end = indptr[i], indptr[i + 1]
-            if r_start < r_end:
-                r_data, r_indices = data[r_start:r_end], indices[r_start:r_end]
-                top_k = min(12, len(r_indices))
-                sorted_idx = np.argsort(r_data)[::-1][:top_k]
-                candidates_map[s1_id].extend([target_ids[r_indices[k]] for k in sorted_idx])
-
-    del X_target_word, X_s1_word, vec_word
+    del X_target_1, X_s1_1, vec1
     gc.collect()
 
-    # --- STAGE 2: Char-level TF-IDF (3,4) ---
-    print(f"    [Stage 2] Fitting Char_wb TF-IDF (max_df=0.02) on sample of {sample_size:,} records...", flush=True)
-    vec_char = TfidfVectorizer(
-        analyzer="char_wb",
-        ngram_range=(3, 4),
-        max_df=0.02,
-        min_df=3,
-        max_features=120000,
+    # --- CHANNEL 2: Word-level TF-IDF (Name Only) ---
+    print(f"    [Channel 2] Fitting Word TF-IDF (Name Only) on sample of {sample_size:,} records...", flush=True)
+    vec2 = TfidfVectorizer(
+        ngram_range=(1, 2),
+        max_df=0.005,
+        min_df=2,
+        max_features=80000,
         sublinear_tf=True
     )
-    vec_char.fit(sample_texts)
+    vec2.fit(target_name[sample_indices])
 
-    print("    [Stage 2] Transforming Target records in chunks...", flush=True)
-    target_char_blocks = [vec_char.transform(target_texts[c:c+chunk_size]) for c in range(0, len(target_texts), chunk_size)]
-    X_target_char = vstack(target_char_blocks, format="csr")
-    del target_char_blocks
+    print("    [Channel 2] Transforming Target and S1 Query matrices...", flush=True)
+    X_target_2 = parallel_tfidf_transform(vec2, target_name, n_jobs=n_threads)
+    X_s1_2 = parallel_tfidf_transform(vec2, s1_name, n_jobs=n_threads)
 
-    print("    [Stage 2] Transforming S1 Query records...", flush=True)
-    X_s1_char = vec_char.transform(s1_texts)
+    print("    [Channel 2] Retrieving Top-K Candidates with sparse_dot_topn C++...", flush=True)
+    ch2_cands = fast_chunked_sparse_topk(X_s1_2, X_target_2, target_ids, top_k=8, n_threads=n_threads)
 
-    print("    [Stage 2] Retrieving Char Top-K Candidates...", flush=True)
-    for start_idx in range(0, X_s1_char.shape[0], batch_size):
-        end_idx = min(start_idx + batch_size, X_s1_char.shape[0])
-        sim_matrix = X_s1_char[start_idx:end_idx].dot(X_target_char.T).tocsr()
+    del X_target_2, X_s1_2, vec2
+    gc.collect()
 
-        indptr, indices, data = sim_matrix.indptr, sim_matrix.indices, sim_matrix.data
-        for i in range(sim_matrix.shape[0]):
-            s1_id = s1_ids[start_idx + i]
-            r_start, r_end = indptr[i], indptr[i + 1]
-            if r_start < r_end:
-                r_data, r_indices = data[r_start:r_end], indices[r_start:r_end]
-                top_k = min(12, len(r_indices))
-                sorted_idx = np.argsort(r_data)[::-1][:top_k]
-                candidates_map[s1_id].extend([target_ids[r_indices[k]] for k in sorted_idx])
+    # --- CHANNEL 3: Char_wb TF-IDF (Name Only - Typos & Acronyms) ---
+    print(f"    [Channel 3] Fitting Char_wb TF-IDF (Name Only) on sample of {sample_size:,} records...", flush=True)
+    vec3 = TfidfVectorizer(
+        analyzer="char_wb",
+        ngram_range=(3, 4),
+        max_df=0.005,
+        min_df=3,
+        max_features=80000,
+        sublinear_tf=True
+    )
+    vec3.fit(target_name[sample_indices])
 
-    del X_target_char, X_s1_char, vec_char
+    print("    [Channel 3] Transforming Target and S1 Query matrices...", flush=True)
+    X_target_3 = parallel_tfidf_transform(vec3, target_name, n_jobs=n_threads)
+    X_s1_3 = parallel_tfidf_transform(vec3, s1_name, n_jobs=n_threads)
+
+    print("    [Channel 3] Retrieving Top-K Candidates with sparse_dot_topn C++...", flush=True)
+    ch3_cands = fast_chunked_sparse_topk(X_s1_3, X_target_3, target_ids, top_k=6, n_threads=n_threads)
+
+    del X_target_3, X_s1_3, vec3
     gc.collect()
 
     # Deduplicate and cap candidates per S1 entity
+    print("    Merging & Deduplicating 3-Channel Candidates...", flush=True)
     final_candidates_map = {}
-    for s1_id, c_list in candidates_map.items():
-        # Preserve order while deduplicating
-        dedup_cands = list(dict.fromkeys(c_list))[:max_candidates_per_s1]
+    for i in range(len(s1_ids)):
+        s1_id = s1_ids[i]
+        combined = ch1_cands[i] + ch2_cands[i] + ch3_cands[i]
+        dedup_cands = list(dict.fromkeys(combined))[:max_candidates_per_s1]
         final_candidates_map[s1_id] = dedup_cands
 
     return final_candidates_map
@@ -172,6 +231,7 @@ def generate_candidate_pairs(
     all_candidate_rows = []
 
     for country in countries:
+        t0_p = time.time()
         print(f"\nProcessing Country Partition: {country}", flush=True)
         s1_partition = df_s1[df_s1["country"] == country].copy()
         target_partition = df_targets[df_targets["country"] == country].copy()
@@ -187,6 +247,9 @@ def generate_candidate_pairs(
         for s1_id, candidate_ids in partition_candidates.items():
             cand_str = ",".join(candidate_ids) if candidate_ids else ""
             all_candidate_rows.append({"source1_entity_id": s1_id, "candidate_entity_ids": cand_str})
+
+        t1_p = time.time()
+        print(f"  Completed Country Partition {country} in {t1_p - t0_p:.2f} seconds.", flush=True)
 
     df_cand = pd.DataFrame(all_candidate_rows)
     return df_cand
@@ -335,6 +398,7 @@ def evaluate_blocking_qc(
 
 
 if __name__ == "__main__":
+    t0_main = time.time()
     val_s1_path = os.path.abspath("dataset/split/val_split/val_source1.tsv")
     val_gt_path = os.path.abspath("dataset/split/val_split/val_ground_truth.tsv")
 
@@ -363,3 +427,5 @@ if __name__ == "__main__":
     # Evaluate QC Matrix
     total_targets = len(df_s2) + len(df_s3)
     evaluate_blocking_qc(df_cand, df_gt, len(df_s1), total_targets)
+    t1_main = time.time()
+    print(f"Phase 2 Candidate Generation Completed in total {t1_main - t0_main:.2f} seconds!", flush=True)
