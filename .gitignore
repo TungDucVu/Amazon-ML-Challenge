@@ -1,0 +1,15 @@
+# Large dataset files & zip archives (GitHub 100MB limit)
+*.zip
+*.tsv
+*.tar.gz
+dataset/
+output/
+__MACOSX/
+.DS_Store
+
+# Virtual environments & Cache
+.venv/
+venv/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/

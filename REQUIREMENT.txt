@@ -1,0 +1,52 @@
+================================================================================
+AMAZON ML CHALLENGE 2026: BUSINESS ENTITY RESOLUTION - REQUIREMENTS SUMMARY
+================================================================================
+
+1. PROBLEM OVERVIEW
+   - Task: Determine entity resolution (ER) matches across 3 independent, noisy data sources (Source 1, Source 2, Source 3).
+   - Reference Source: Source 1 is the deduplicated reference source.
+   - Objective: For each entity in Source 1, identify all matching entities in Source 2 and Source 3.
+   - Match Cardinality: One-to-Zero, One-to-One, or One-to-Many. A Source 1 entity can match 0, 1, or multiple records across Source 2 and Source 3.
+
+2. DATA SPECIFICATIONS & NOISE PATTERNS
+   - File Format: Tab-Separated Values (.tsv). Files must be parsed using explicit tab separators (`sep="\t"`).
+   - Schema per source file (*_source1.tsv, *_source2.tsv, *_source3.tsv):
+     * `entity_id`: Unique identifier starting with prefix `S1-`, `S2-`, or `S3-`.
+     * `business_name`: Name of business entity (contains abbreviations, legal suffixes, typos, transliterations, word-order transpositions, punctuation variations).
+     * `business_address`: Address of business (contains missing components, landmark-based references, municipal variations, non-standard abbreviations).
+     * `country`: String label for country.
+   - Ground Truth File (`train_ground_truth.tsv`):
+     * Columns: `source1_entity_id`, `matched_entity_ids` (comma-separated list of S2- and/or S3- IDs).
+
+3. OPEN-SET COUNTRY REQUIREMENT
+   - Training Set Countries: `US` and `India`.
+   - Test Set Countries: `US`, `India`, and `France` (unseen in training data).
+   - Mandatory Behavior: Pipelines and models MUST be zero-shot/open-set capable for unseen countries. DO NOT hard-code, one-hot encode, or filter predictions by training countries (`US`, `India`). Every test entity (including `France`) must be processed and present in the final output.
+
+4. REQUIRED OUTPUT FORMAT & FILES
+   - Output Directory: `output/`
+   - File 1: `output/matching_results.tsv` (Scored on Leaderboard)
+     * Header: `source1_entity_id\tmatched_entity_ids`
+     * Contains final predicted matches for every Source 1 entity in the test set.
+     * Leave `matched_entity_ids` empty for singletons (0 matches).
+   - File 2: `output/candidate_pairs.tsv` (Audited for blocking quality & reduction ratio)
+     * Header: `source1_entity_id\tcandidate_entity_ids`
+     * Contains the exact set of candidate IDs passed from the blocking stage to the inference classifier.
+     * Rule: All IDs in `matching_results.tsv` MUST be a subset of `candidate_pairs.tsv`.
+   - Validation Requirement: Submissions MUST pass `utils/validate_submission.py` locally before uploading.
+
+5. EVALUATION METRIC
+   - Primary Metric: Macro-averaged F_0.5 score across all Source 1 test entities.
+   - Formula: F_0.5 = (1.25 * Precision * Recall) / (0.25 * Precision + Recall)
+   - Metric Characteristics: Precision-heavy (weights Precision 2x over Recall to penalize false merges).
+   - Singleton Scoring: Singletons with zero true matches score 1.0 if correctly predicted empty, and 0.0 if any false match is predicted.
+
+6. CONSTRAINTS & COMPLIANCE RULES
+   - Strict Prohibition on External Data Lookups: NO commercial ER APIs, government business registries, geocoding services, or internet lookup tools. All training/inference must use ONLY the provided dataset.
+   - Model Parameter Limit: Max 8 Billion parameters.
+   - License Constraint: Open-source models must follow MIT or Apache 2.0 licenses.
+   - Deliverable Package: Top teams submit a single `.zip` containing:
+     * `output/matching_results.tsv` & `output/candidate_pairs.tsv`
+     * `code/business_entity_resolution/` (containing `src/`, `README.md`, `requirements.txt`)
+     * `Documentation_template.md` (filled methodology write-up).
+================================================================================
