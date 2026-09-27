@@ -1,15 +1,44 @@
-# Large dataset files & zip archives (GitHub 100MB limit)
-*.zip
-*.tsv
-*.tar.gz
+# Dataset files & Raw Archives
 dataset/
-output/
-__MACOSX/
-.DS_Store
+6ab10eb3b23ba_student_resource/
+6ab10eb3b23ba_student_resource.zip
+*.zip
+*.tar.gz
+*.tgz
+*.rar
+*.7z
 
-# Virtual environments & Cache
+# TSV and CSV Data Files
+*.tsv
+*.csv
+*.parquet
+
+# Output directory & submission packages
+output/
+*.log
+
+# Model artifacts, serialized models, cached vectors
+*.pkl
+*.joblib
+*.npz
+*.npy
+*.pth
+*.pt
+*.bin
+*.onnx
+*.h5
+
+# Virtual Environments & Python Cache
 .venv/
 venv/
+env/
 __pycache__/
 *.pyc
 .ipynb_checkpoints/
+.pytest_cache/
+
+# OS & IDE Settings
+.DS_Store
+__MACOSX/
+.vscode/
+.idea/
