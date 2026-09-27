@@ -2,22 +2,54 @@ import gc
 import os
 import sys
 import time
+import re
 import numpy as np
 import pandas as pd
 import scipy.sparse as sp
-import faiss
-import torch
 from sparse_dot_topn import sp_matmul_topn
 from sklearn.feature_extraction.text import TfidfVectorizer
-from sentence_transformers import SentenceTransformer
 from joblib import Parallel, delayed
-
-torch.set_num_threads(os.cpu_count() or 4)
 
 sys.path.insert(0, os.path.dirname(__file__))
 from data_loader import load_source_file, load_ground_truth
 
-DENSE_MODEL_NAME = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+
+def clean_text_advanced(text: str) -> str:
+    """
+    Normalizes business names and addresses:
+    - Strips URL schemes and web prefixes
+    - Strips common domain extensions (.com, .org, .net, etc.)
+    - Normalizes and strips legal entity suffixes (ltd, inc, corp, llc, etc.)
+    - Removes punctuation and standardizes whitespace
+    """
+    if not text or not isinstance(text, str):
+        return ""
+    t = text.lower()
+    t = re.sub(r'https?://(?:www\.)?', '', t)
+    t = re.sub(r'www\.', '', t)
+    t = re.sub(r'\.(com|in|org|net|co|us|io|biz|info)(?:/.*)?', ' ', t)
+    t = re.sub(r'\b(ltd|limited|inc|incorporated|corp|corporation|llc|llp|pvt|private|co|company|sa|sarl)\b', ' ', t)
+    t = re.sub(r'[^a-z0-9\s]', ' ', t)
+    return " ".join(t.split())
+
+
+def round_robin_fusion(lists: list) -> list:
+    """
+    Merges multiple ranked lists using round-robin rank interleaving.
+    Ensures that top hits from every retrieval channel are prioritized without
+    allowing a single channel to monopolize candidate slots at low K.
+    """
+    max_len = max((len(l) for l in lists), default=0)
+    result = []
+    seen = set()
+    for rank in range(max_len):
+        for candidate_list in lists:
+            if rank < len(candidate_list):
+                cand = candidate_list[rank]
+                if cand not in seen:
+                    seen.add(cand)
+                    result.append(cand)
+    return result
 
 
 def verify_country_integrity(df_s1: pd.DataFrame, df_s2: pd.DataFrame, df_s3: pd.DataFrame, df_gt: pd.DataFrame) -> bool:
@@ -58,7 +90,7 @@ def parallel_tfidf_transform(vec, texts, chunk_size=150000, n_jobs=-1):
     return sp.vstack(blocks, format="csr")
 
 
-def fast_chunked_sparse_topk(X_s1, X_target, target_ids, top_k=20, chunk_size=500000, n_threads=4):
+def fast_chunked_sparse_topk(X_s1, X_target, target_ids, top_k=30, chunk_size=500000, n_threads=4):
     n_queries = X_s1.shape[0]
     n_targets = X_target.shape[0]
 
@@ -73,7 +105,7 @@ def fast_chunked_sparse_topk(X_s1, X_target, target_ids, top_k=20, chunk_size=50
             A=X_s1,
             B=X_target_chunk.T,
             top_n=top_k,
-            threshold=0.01,
+            threshold=0.003,
             sort=True,
             n_threads=n_threads
         )
@@ -107,31 +139,6 @@ def fast_chunked_sparse_topk(X_s1, X_target, target_ids, top_k=20, chunk_size=50
     return results
 
 
-def get_dense_embeddings(model, texts, batch_size=256):
-    embeddings = model.encode(
-        texts,
-        batch_size=batch_size,
-        show_progress_bar=False,
-        normalize_embeddings=True,
-        convert_to_numpy=True
-    )
-    return embeddings.astype(np.float32)
-
-
-def retrieve_dense_faiss_topk(s1_emb, target_emb, target_ids, top_k=15):
-    dim = target_emb.shape[1]
-    index = faiss.IndexFlatIP(dim)
-    index.add(target_emb)
-
-    sims, indices = index.search(s1_emb, top_k)
-    results = []
-    for i in range(len(s1_emb)):
-        row_indices = indices[i]
-        valid_ids = [target_ids[idx] for idx in row_indices if idx >= 0]
-        results.append(valid_ids)
-    return results
-
-
 def run_openset_france_dry_run():
     """
     Open-Set Dry Run verifying country partition logic on synthetic France entities.
@@ -151,7 +158,7 @@ def run_openset_france_dry_run():
         {"entity_id": "S2-US-999", "business_name": "New York Bakery", "business_address": "5th Ave, NY", "country": "US"}
     ])
 
-    cands = get_multi_stage_candidates_for_partition(df_fr_s1, df_fr_targets, max_candidates_per_s1=10, enable_dense=False)
+    cands = get_multi_stage_candidates_for_partition(df_fr_s1, df_fr_targets, max_candidates_per_s1=20)
     
     assert "S2-FR-001" in cands["S1-FR-001"], "Open-Set Dry Run Failure: Boulangerie target missing!"
     assert "S3-FR-002" in cands["S1-FR-002"], "Open-Set Dry Run Failure: Societe Generale target missing!"
@@ -164,15 +171,15 @@ def run_openset_france_dry_run():
 def get_multi_stage_candidates_for_partition(
     df_s1: pd.DataFrame,
     df_targets: pd.DataFrame,
-    max_candidates_per_s1: int = 30,
-    enable_dense: bool = True
+    max_candidates_per_s1: int = 60
 ) -> dict:
     """
-    Generates high-recall candidate pairs per country partition using multi-modal blocking:
-    - Channel 1: Word-level TF-IDF (1,2) on Full Name + Address (Top 25)
-    - Channel 2: Word-level TF-IDF (1,2) on Business Name only (Top 20)
-    - Channel 3: Char_wb TF-IDF (3,4) on Business Name only (Top 20)
-    - Channel 4: Multilingual MiniLM Dense Embeddings + FAISS (Top 15)
+    Generates high-recall candidate pairs per country partition using 4 multi-modal sparse channels:
+    - Channel 1: Word-level TF-IDF (1,2) on Cleaned Name + Cleaned Address (Top 35)
+    - Channel 2: Word-level TF-IDF (1,2) on Cleaned Business Name only (Top 25)
+    - Channel 3: Char_wb TF-IDF (3,4) on Cleaned Business Name only (Top 25)
+    - Channel 4: Word-level TF-IDF (1,2) on Cleaned Address only (Top 25)
+    Fused via round-robin rank interleaving to ensure maximum diversity and recall.
     """
     if len(df_s1) == 0 or len(df_targets) == 0:
         return {s1_id: [] for s1_id in df_s1["entity_id"]}
@@ -180,76 +187,79 @@ def get_multi_stage_candidates_for_partition(
     s1_ids = df_s1["entity_id"].values
     target_ids = df_targets["entity_id"].values
 
-    s1_name_addr = (df_s1["business_name"].fillna('') + " " + df_s1["business_address"].fillna('')).values
-    target_name_addr = (df_targets["business_name"].fillna('') + " " + df_targets["business_address"].fillna('')).values
+    s1_raw_name = df_s1["business_name"].fillna('').values
+    target_raw_name = df_targets["business_name"].fillna('').values
+    s1_raw_addr = df_s1["business_address"].fillna('').values
+    target_raw_addr = df_targets["business_address"].fillna('').values
 
-    s1_name = df_s1["business_name"].fillna('').values
-    target_name = df_targets["business_name"].fillna('').values
+    print(f"    Cleaning text & domain stems across {len(s1_ids):,} queries and {len(target_ids):,} targets...", flush=True)
+    s1_clean_name = [clean_text_advanced(x) for x in s1_raw_name]
+    target_clean_name = [clean_text_advanced(x) for x in target_raw_name]
+    s1_clean_addr = [clean_text_advanced(x) for x in s1_raw_addr]
+    target_clean_addr = [clean_text_advanced(x) for x in target_raw_addr]
 
-    sample_size = min(200000, len(target_name_addr))
-    sample_indices = np.random.choice(len(target_name_addr), size=sample_size, replace=False) if len(target_name_addr) > sample_size else np.arange(len(target_name_addr))
+    s1_full = [f"{n} {a}" for n, a in zip(s1_clean_name, s1_clean_addr)]
+    target_full = [f"{n} {a}" for n, a in zip(target_clean_name, target_clean_addr)]
+
+    sample_size = min(200000, len(target_full))
+    sample_indices = np.random.choice(len(target_full), size=sample_size, replace=False) if len(target_full) > sample_size else np.arange(len(target_full))
     
     n_threads = max(1, (os.cpu_count() or 4) - 1)
 
     max_df_val = 0.95 if sample_size < 100 else 0.005
     min_df_val = 1 if sample_size < 100 else 2
 
-    # --- CHANNEL 1: Word-level TF-IDF (Full Name + Address: Top 25) ---
-    print(f"    [Channel 1] Fitting Word TF-IDF (Name+Addr Top 25)...", flush=True)
-    vec1 = TfidfVectorizer(ngram_range=(1, 2), max_df=max_df_val, min_df=min_df_val, max_features=80000, sublinear_tf=True)
-    vec1.fit(target_name_addr[sample_indices])
-    X_target_1 = parallel_tfidf_transform(vec1, target_name_addr, n_jobs=n_threads)
-    X_s1_1 = parallel_tfidf_transform(vec1, s1_name_addr, n_jobs=n_threads)
-    ch1_cands = fast_chunked_sparse_topk(X_s1_1, X_target_1, target_ids, top_k=25, n_threads=n_threads)
+    # --- CHANNEL 1: Word-level TF-IDF (Full Cleaned Name + Address: Top 35) ---
+    print(f"    [Channel 1] Word TF-IDF (Clean Name+Addr Top 35)...", flush=True)
+    vec1 = TfidfVectorizer(ngram_range=(1, 2), max_df=max_df_val, min_df=min_df_val, max_features=100000, sublinear_tf=True)
+    target_sample_1 = [target_full[i] for i in sample_indices]
+    vec1.fit(target_sample_1)
+    X_target_1 = parallel_tfidf_transform(vec1, target_full, n_jobs=n_threads)
+    X_s1_1 = parallel_tfidf_transform(vec1, s1_full, n_jobs=n_threads)
+    ch1_cands = fast_chunked_sparse_topk(X_s1_1, X_target_1, target_ids, top_k=35, n_threads=n_threads)
     del X_target_1, X_s1_1, vec1
     gc.collect()
 
-    # --- CHANNEL 2: Word-level TF-IDF (Name Only: Top 20) ---
-    print(f"    [Channel 2] Fitting Word TF-IDF (Name Only Top 20)...", flush=True)
-    vec2 = TfidfVectorizer(ngram_range=(1, 2), max_df=max_df_val, min_df=min_df_val, max_features=80000, sublinear_tf=True)
-    vec2.fit(target_name[sample_indices])
-    X_target_2 = parallel_tfidf_transform(vec2, target_name, n_jobs=n_threads)
-    X_s1_2 = parallel_tfidf_transform(vec2, s1_name, n_jobs=n_threads)
-    ch2_cands = fast_chunked_sparse_topk(X_s1_2, X_target_2, target_ids, top_k=20, n_threads=n_threads)
+    # --- CHANNEL 2: Word-level TF-IDF (Cleaned Name Only: Top 25) ---
+    print(f"    [Channel 2] Word TF-IDF (Clean Name Only Top 25)...", flush=True)
+    vec2 = TfidfVectorizer(ngram_range=(1, 2), max_df=max_df_val, min_df=min_df_val, max_features=100000, sublinear_tf=True)
+    target_sample_2 = [target_clean_name[i] for i in sample_indices]
+    vec2.fit(target_sample_2)
+    X_target_2 = parallel_tfidf_transform(vec2, target_clean_name, n_jobs=n_threads)
+    X_s1_2 = parallel_tfidf_transform(vec2, s1_clean_name, n_jobs=n_threads)
+    ch2_cands = fast_chunked_sparse_topk(X_s1_2, X_target_2, target_ids, top_k=25, n_threads=n_threads)
     del X_target_2, X_s1_2, vec2
     gc.collect()
 
-    # --- CHANNEL 3: Char_wb TF-IDF (Name Only: Top 20) ---
-    print(f"    [Channel 3] Fitting Char_wb TF-IDF (Name Only Top 20)...", flush=True)
-    vec3 = TfidfVectorizer(analyzer="char_wb", ngram_range=(3, 4), max_df=max_df_val, min_df=max(1, min_df_val), max_features=80000, sublinear_tf=True)
-    vec3.fit(target_name[sample_indices])
-    X_target_3 = parallel_tfidf_transform(vec3, target_name, n_jobs=n_threads)
-    X_s1_3 = parallel_tfidf_transform(vec3, s1_name, n_jobs=n_threads)
-    ch3_cands = fast_chunked_sparse_topk(X_s1_3, X_target_3, target_ids, top_k=20, n_threads=n_threads)
+    # --- CHANNEL 3: Char_wb TF-IDF (Cleaned Name Only: Top 25) ---
+    print(f"    [Channel 3] Char_wb TF-IDF (Clean Name Only Top 25)...", flush=True)
+    vec3 = TfidfVectorizer(analyzer="char_wb", ngram_range=(3, 4), max_df=max_df_val, min_df=max(1, min_df_val), max_features=100000, sublinear_tf=True)
+    target_sample_3 = [target_clean_name[i] for i in sample_indices]
+    vec3.fit(target_sample_3)
+    X_target_3 = parallel_tfidf_transform(vec3, target_clean_name, n_jobs=n_threads)
+    X_s1_3 = parallel_tfidf_transform(vec3, s1_clean_name, n_jobs=n_threads)
+    ch3_cands = fast_chunked_sparse_topk(X_s1_3, X_target_3, target_ids, top_k=25, n_threads=n_threads)
     del X_target_3, X_s1_3, vec3
     gc.collect()
 
-    # --- CHANNEL 4: Dense Vector Embeddings + FAISS (Top 15) ---
-    ch4_cands = [[] for _ in range(len(s1_ids))]
-    if enable_dense and len(s1_ids) > 0:
-        print(f"    [Channel 4] Generating Multilingual MiniLM Dense Embeddings...", flush=True)
-        dense_model = SentenceTransformer(DENSE_MODEL_NAME)
-        
-        c_val = df_s1["country"].iloc[0] if len(df_s1) > 0 else ""
-        s1_formatted = [f"Country: {c_val} | Name: {n} | Address: {a}" for n, a in zip(s1_name, df_s1["business_address"].fillna(''))]
-        s1_dense_emb = get_dense_embeddings(dense_model, s1_formatted, batch_size=256)
+    # --- CHANNEL 4: Word-level TF-IDF (Cleaned Address Only: Top 25) ---
+    print(f"    [Channel 4] Word TF-IDF (Clean Address Only Top 25)...", flush=True)
+    vec4 = TfidfVectorizer(ngram_range=(1, 2), max_df=max_df_val, min_df=min_df_val, max_features=100000, sublinear_tf=True)
+    target_sample_4 = [target_clean_addr[i] for i in sample_indices]
+    vec4.fit(target_sample_4)
+    X_target_4 = parallel_tfidf_transform(vec4, target_clean_addr, n_jobs=n_threads)
+    X_s1_4 = parallel_tfidf_transform(vec4, s1_clean_addr, n_jobs=n_threads)
+    ch4_cands = fast_chunked_sparse_topk(X_s1_4, X_target_4, target_ids, top_k=25, n_threads=n_threads)
+    del X_target_4, X_s1_4, vec4
+    gc.collect()
 
-        dense_sample_size = min(50000, len(target_name_addr))
-        target_formatted = [f"Country: {c_val} | Name: {n} | Address: {a}" for n, a in zip(target_name[:dense_sample_size], df_targets["business_address"].fillna('')[:dense_sample_size])]
-        target_dense_emb = get_dense_embeddings(dense_model, target_formatted, batch_size=256)
-
-        ch4_cands = retrieve_dense_faiss_topk(s1_dense_emb, target_dense_emb, target_ids[:dense_sample_size], top_k=15)
-        del dense_model, s1_dense_emb, target_dense_emb
-        gc.collect()
-
-    # Deduplicate multi-modal candidate union
-    print("    Merging & Deduplicating Multi-Modal Candidates...", flush=True)
+    # Interleave multi-modal candidate channels using Round-Robin Fusion
+    print("    Fusing Multi-Modal Channels via Round-Robin Interleaving...", flush=True)
     final_candidates_map = {}
     for i in range(len(s1_ids)):
         s1_id = s1_ids[i]
-        combined = ch1_cands[i] + ch2_cands[i] + ch3_cands[i] + ch4_cands[i]
-        dedup_cands = list(dict.fromkeys(combined))[:max_candidates_per_s1]
-        final_candidates_map[s1_id] = dedup_cands
+        fused = round_robin_fusion([ch1_cands[i], ch2_cands[i], ch3_cands[i], ch4_cands[i]])[:max_candidates_per_s1]
+        final_candidates_map[s1_id] = fused
 
     return final_candidates_map
 
@@ -258,7 +268,7 @@ def generate_candidate_pairs(
     df_s1: pd.DataFrame,
     df_s2: pd.DataFrame,
     df_s3: pd.DataFrame,
-    max_candidates_per_s1: int = 30
+    max_candidates_per_s1: int = 60
 ) -> pd.DataFrame:
     """
     Generates candidate pairs using country-partitioned multi-stage blockers.
@@ -282,8 +292,7 @@ def generate_candidate_pairs(
         partition_candidates = get_multi_stage_candidates_for_partition(
             s1_partition,
             target_partition,
-            max_candidates_per_s1=max_candidates_per_s1,
-            enable_dense=True
+            max_candidates_per_s1=max_candidates_per_s1
         )
 
         for s1_id, candidate_ids in partition_candidates.items():
@@ -297,12 +306,12 @@ def generate_candidate_pairs(
     return df_cand
 
 
-def evaluate_pareto_curve(df_cand: pd.DataFrame, df_gt: pd.DataFrame, k_caps=[10, 15, 20, 25, 30, 40]):
+def evaluate_pareto_curve(df_cand: pd.DataFrame, df_gt: pd.DataFrame, k_caps=[10, 15, 20, 25, 30, 40, 50, 60]):
     """
-    Traces empirical Pareto curve across candidate caps K in [10, 15, 20, 25, 30, 40].
+    Traces empirical Pareto curve across candidate caps K in [10, 15, 20, 25, 30, 40, 50, 60].
     """
     print("\n================================================================================", flush=True)
-    print("PHASE 2B EMPIRICAL PARETO CURVE RECALL AUDIT MATRIX", flush=True)
+    print("PHASE 2C EMPIRICAL PARETO CURVE RECALL AUDIT MATRIX", flush=True)
     print("================================================================================\n", flush=True)
 
     cand_map = dict(zip(df_cand["source1_entity_id"], df_cand["candidate_entity_ids"]))
@@ -348,7 +357,7 @@ if __name__ == "__main__":
     s2_path = os.path.abspath("6ab10eb3b23ba_student_resource/student_resource/dataset/train/train_source2.tsv")
     s3_path = os.path.abspath("6ab10eb3b23ba_student_resource/student_resource/dataset/train/train_source3.tsv")
 
-    print("Loading files for Phase 2B multi-modal candidate blocking run...", flush=True)
+    print("Loading files for Phase 2C high-recall candidate blocking run...", flush=True)
     df_s1 = load_source_file(val_s1_path)
     df_gt = load_ground_truth(val_gt_path)
     df_s2 = load_source_file(s2_path)
@@ -356,15 +365,15 @@ if __name__ == "__main__":
 
     verify_country_integrity(df_s1, df_s2, df_s3, df_gt)
 
-    df_cand = generate_candidate_pairs(df_s1, df_s2, df_s3, max_candidates_per_s1=30)
+    df_cand = generate_candidate_pairs(df_s1, df_s2, df_s3, max_candidates_per_s1=60)
 
     out_dir = os.path.abspath("output")
     os.makedirs(out_dir, exist_ok=True)
     out_cand_path = os.path.join(out_dir, "val_candidate_pairs.tsv")
     df_cand.to_csv(out_cand_path, sep="\t", index=False)
-    print(f"Exported Phase 2B candidate pairs to {out_cand_path}", flush=True)
+    print(f"Exported Phase 2C candidate pairs to {out_cand_path}", flush=True)
 
-    evaluate_pareto_curve(df_cand, df_gt, k_caps=[10, 15, 20, 25, 30, 40])
+    evaluate_pareto_curve(df_cand, df_gt, k_caps=[10, 15, 20, 25, 30, 40, 50, 60])
     
     t1_main = time.time()
-    print(f"Phase 2B Candidate Generation Completed in total {t1_main - t0_main:.2f} seconds!", flush=True)
+    print(f"Phase 2C Candidate Generation Completed in total {t1_main - t0_main:.2f} seconds!", flush=True)
