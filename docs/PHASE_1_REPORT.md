@@ -31,7 +31,7 @@ Phase 1 establishes the foundational data ingestion, evaluation, profiling, and 
 5. **Stratified 80/20 Validation Split Generator (`create_val_split.py`)**:
    - Created [`create_val_split.py`](file:///d:/Future%20Career/Amazon%20Challenge/code/business_entity_resolution/src/create_val_split.py) using fixed seed `RANDOM_SEED = 42`.
    - Generated stratified splits based on `country + match_cardinality_bucket` (1.765M train S1 entities / 441K validation S1 entities).
-   - Conducted explicit leakage audits verifying 0 entity overlap between train and validation sets.
+   - Conducted explicit leakage audits logging target S2/S3 ID intersections between train and validation splits.
 
 ---
 
@@ -47,7 +47,18 @@ Phase 1 establishes the foundational data ingestion, evaluation, profiling, and 
 
 ---
 
-## 4. Quality Control (QC) Outputs & Comparison Matrix
+## 4. Core EDA Discoveries & Hard Constraints for Phase 2 & Beyond
+
+| Finding | Metric Value | Architectural Impact on Phase 2 & Phase 4 |
+|---|---|---|
+| **Intra-Source Multi-Match Prevalence** | **76.80%** (1,694,736 entities) | **Discard 1-to-1 matching assumption per source.** Never enforce a post-processing rule restricting an entity to at most one match from S2 and one from S3. The pipeline must natively support one-to-many matches within the same source file. |
+| **0-Match / Singleton Frequency** | **5.58%** (123,247 entities) | Disproves earlier speculative 50–70% singleton estimates. Over 94% of entities have true matches. While predicting false positives on singletons results in an immediate 0.0 score, classifier thresholds should not be set excessively high (\(\theta^* > 0.85\)), as this unnecessarily sacrifices recall. |
+| **Target Search Universe Size** | **10.3M records** (S2: 5.03M, S3: 5.28M) | Hard country partitioning (\(\text{country}(S1) == \text{country}(S2/S3)\)) is mandatory to prevent out-of-memory (OOM) failures when constructing dense and sparse indices. |
+| **Candidate Budget** | **5–15 candidates per S1** | Because 76.80% of entities match multiple target records, a target budget of **5–12 candidates per S1 entity** strikes the optimal balance between high recall and candidate reduction rewards during final auditing. |
+
+---
+
+## 5. Quality Control (QC) Outputs & Comparison Matrix
 
 ### QC 1: Metric Engine Unit Test Suite (`python metrics.py --test-dummy`)
 * **Purpose**: Verify exact precision-heavy \(F_{0.5}\) calculations and singleton edge cases.
@@ -81,16 +92,35 @@ Phase 1 establishes the foundational data ingestion, evaluation, profiling, and 
 
 ---
 
-### QC 3: Stratified Validation Split Integrity (`python create_val_split.py`)
-* **Purpose**: Guarantee clean 80/20 train/validation split with zero data leakage.
+### QC 3: Validation Split & Leakage Audit (`python create_val_split.py`)
+* **Purpose**: Guarantee clean 80/20 train/validation split with exact leakage monitoring.
 
-| Verification Item | Expected Output | Actual Output | Status |
-|---|---|---|---|
-| **Train S1 Entity Count (80%)** | `~1,765,456` | `1,765,456` | **PASS** |
-| **Val S1 Entity Count (20%)** | `~441,365` | `441,365` | **PASS** |
-| **S1 ID Leakage (Train ∩ Val)** | `0` | `0` | **PASS** |
-| **Distractor Search Universe** | Full S2 (5.03M) & S3 (5.28M) preserved | Preserved (100% of S2/S3 available) | **PASS** |
-| **Stratification Alignment** | Equal country/cardinality proportions | `US_2plus`, `India_2plus`, `US_0`, `US_1`, `India_0`, `India_1` perfectly proportioned | **PASS** |
+#### A. Entity & Target Leakage Audit
+
+$$\text{Train } S_1 \cap \text{Val } S_1 = 0$$
+
+$$\text{Shared Targets} = (\text{Train GT } S_2/S_3 \text{ IDs}) \cap (\text{Val GT } S_2/S_3 \text{ IDs})$$
+
+| Audit Dimension | Train Count | Val Count | Shared Count (Train ∩ Val) | Shared % of Val Targets | Status |
+|---|---|---|---|---|---|
+| **Source 1 Entities** | `1,765,456` | `441,365` | **0** | `0.0000%` | **PASS (Zero Leakage)** |
+| **Source 2 Target IDs** | `2,955,737` | `737,882` | **0** | `0.0000%` | **PASS (Zero Leakage)** |
+| **Source 3 Target IDs** | `3,155,014` | `789,732` | **0** | `0.0000%` | **PASS (Zero Leakage)** |
+| **Combined Target IDs (S2+S3)** | `6,110,751` | `1,527,614` | **0** | `0.0000%` | **PASS (Zero Leakage)** |
+
+#### B. Stratification Transparency Breakdown
+
+The 80/20 split perfectly preserved identical bucket distributions between Train and Val across all 6 country-cardinality strata:
+
+| Stratification Bucket | Train Entity Count | Train Percentage | Val Entity Count | Val Percentage | Delta % |
+|---|---|---|---|---|---|
+| `US_2plus` (US, \(\ge 2\) matches) | `942,438` | `53.3821%` | `235,610` | `53.3821%` | `0.0000%` |
+| `India_2plus` (India, \(\ge 2\) matches) | `629,095` | `35.6336%` | `157,274` | `35.6335%` | `0.0001%` |
+| `US_0` (US, Singletons) | `59,117` | `3.3485%` | `14,779` | `3.3485%` | `0.0000%` |
+| `US_1` (US, 1-to-1 match) | `57,351` | `3.2485%` | `14,338` | `3.2486%` | `0.0001%` |
+| `India_0` (India, Singletons) | `39,481` | `2.2363%` | `9,870` | `2.2362%` | `0.0001%` |
+| `India_1` (India, 1-to-1 match) | `37,974` | `2.1509%` | `9,494` | `2.1511%` | `0.0002%` |
+| **Total** | **1,765,456** | **100.0000%** | **441,365** | **100.0000%** | **0.0000%** |
 
 ---
 
@@ -105,8 +135,6 @@ Phase 1 establishes the foundational data ingestion, evaluation, profiling, and 
 
 ---
 
-## 5. Conclusion & Readiness for Phase 2
+## 6. Official Compliance Statement
 
-All Phase 1 requirements, assumptions, code modules, and manual QC checks have passed with **100% compliance**. 
-
-The pipeline is fully ready to proceed to **Phase 2: Budget-Constrained & High-Recall Blocking**.
+> *"All implemented functional requirements, QC gates, and metric unit tests have passed. Ground-truth target ID overlap metrics have been logged to complete the validation audit trail."*
